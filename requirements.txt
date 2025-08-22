@@ -6,4 +6,4 @@ python-dateutil
 scikit-learn
 pillow
 pymupdf
-streamlit-calendar
+easyocr   # opcional (si no lo quieres, quítalo y el OCR se desactiva)
