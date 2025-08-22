@@ -679,6 +679,46 @@ with t5:
     if c3.button("🧹 Limpiar eventos"):
         st.session_state.events = []
         st.success("Eventos eliminados.")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TAB 6: AYUDA / DESPLIEGUE
+# ──────────────────────────────────────────────────────────────────────────────
+with t6:
+    st.subheader("Cómo desplegar en Streamlit Cloud (GitHub)")
+    st.markdown(
+        """
+        1) Crea un repo en GitHub con `app.py`.
+        2) Añade `requirements.txt` con:
+           
+           ```
+           streamlit
+           pandas
+           numpy
+           requests
+           python-dateutil
+           scikit-learn
+           pillow
+           pymupdf
+           streamlit-calendar
+           ```
+           
+        3) En **Streamlit Cloud** → **New app** → selecciona tu repo y rama, archivo principal `app.py`.
+        4) En **Advanced settings → Secrets**, pega:
+           
+           ```
+           OPENROUTER_API_KEY="sk-or-..."
+           APP_PASSWORD="cámbiame"
+           ```
+           
+        5) ¡Listo! Inicia la app y prueba con algunos PDFs o imágenes (para OCR avanzado usa un modelo de visión en OpenRouter y colócalo en Configuración).
+        
+        **Notas**
+        - Este RAG usa TF‑IDF (ligero y sin costos). Puedes cambiar a embeddings externos si lo deseas.
+        - Los metadatos (folio/RFC/fecha/total) se extraen con regex heurísticos; edítalos en la tabla.
+        - El calendario es editable e incluye notas por evento.
+        - La bitácora registra entradas de login, carga de docs, construcción del índice y consultas.
+        - Seguridad básica para demo (usuario fijo *Carla*). Para producción considera OAuth o `streamlit-authenticator`.
+        """
     )
 
 # Fin del archivo
