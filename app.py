@@ -1,4 +1,4 @@
-# app.py — RAG + Agenda (oscuro, Karla, OCR mejorado + LLM visión, calendario estético)
+# app.py — RAG + Agenda (oscuro, Karla, OCR/LLM seleccionable, calendario estético)
 
 import os, io, json, base64, re
 from datetime import datetime, date, timedelta
@@ -19,11 +19,17 @@ except Exception: fitz = None
 try: from streamlit_calendar import calendar
 except Exception: calendar = None
 
+# OCR opcional
 try: import easyocr
 except Exception: easyocr = None
+try:
+    import pytesseract
+    from pytesseract import image_to_string as tesseract_to_text
+except Exception:
+    pytesseract = None
+    tesseract_to_text = None
 
 st.set_page_config(page_title="RAG + Agenda", page_icon="🧠", layout="wide")
-
 st.markdown("""
 <style>
   :root{--bg:#0b1220;--panel:#0f172a;--muted:#94a3b8;--text:#e5e7eb;--primary:#60a5fa;--accent:#34d399;--border:#1e293b}
@@ -43,10 +49,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Estado
+# estado
 if "auth" not in st.session_state: st.session_state.auth=False
 if "user" not in st.session_state: st.session_state.user=None
-if "docs" not in st.session_state: st.session_state.docs: List[Dict[str,Any]]=[]
+if "docs" not in st.session_state: st.session_state.docs=[]
 if "index" not in st.session_state: st.session_state.index=None
 if "events" not in st.session_state: st.session_state.events=[]
 if "log" not in st.session_state: st.session_state.log=[]
@@ -59,7 +65,7 @@ if "settings" not in st.session_state:
         "chunk_overlap":200,
         "top_k":5,
         "force_ocr_pdf":True,
-        "read_method":"Auto",  # Auto | Solo OCR (Python) | Solo LLM visión
+        "read_method":"Solo OCR (Python)",  # "Solo OCR (Python)" | "Solo LLM visión"
         "origen":"Cargados manualmente",
     }
 
@@ -121,24 +127,23 @@ def build_index(docs, chunk_size, overlap):
     st.session_state.index={"vectorizer":vec,"matrix":mat,"mapping":mapping}
     return st.session_state.index
 
-def retrieve(query, top_k, origin_filter=None):
+def retrieve(query, top_k):
     idx=st.session_state.index
     if not idx: return []
     qv=idx["vectorizer"].transform([query])
     sims=cosine_similarity(qv, idx["matrix"]).ravel()
     order=np.argsort(-sims)
     out=[]
-    for ti in order:
+    for ti in order[:top_k]:
         m=idx["mapping"][ti]
         doc=next((d for d in st.session_state.docs if d["id"]==m["doc_id"]),None)
-        if doc and (not origin_filter or doc.get("origen") in origin_filter):
+        if doc:
             chs=chunk_text(doc.get("texto",""), st.session_state.settings["chunk_size"], st.session_state.settings["chunk_overlap"]) or [""]
             ctx=chs[m["chunk_idx"]] if m["chunk_idx"]<len(chs) else ""
             out.append({"score":float(sims[ti]),"doc":doc,"chunk":ctx})
-            if len(out)>=top_k: break
     return out
 
-# --- OCR / Visión
+# OCR / visión
 _OCR=None
 def get_ocr():
     global _OCR
@@ -151,25 +156,31 @@ def preprocess(img: Image.Image) -> Image.Image:
     g=img.convert("L")
     w,h=g.size
     if max(w,h)<1600:
-        scale=1600/max(w,h)
-        g=g.resize((int(w*scale), int(h*scale)))
+        s=1600/max(w,h)
+        g=g.resize((int(w*s), int(h*s)))
     g=ImageEnhance.Contrast(g).enhance(1.6)
     g=ImageEnhance.Sharpness(g).enhance(1.2)
     return g
 
 def ocr_image_text(img: Image.Image) -> str:
+    txt=""
     r=get_ocr()
-    if r is None: return ""
-    try:
-        arr=np.array(preprocess(img))
-        res=r.readtext(arr, detail=0, paragraph=True)
-        return "\n".join([t.strip() for t in res if t and t.strip()])
-    except Exception: return ""
+    if r is not None:
+        try:
+            arr=np.array(preprocess(img))
+            res=r.readtext(arr, detail=0, paragraph=True)
+            txt="\n".join([t.strip() for t in res if t and t.strip()])
+        except Exception: pass
+    if (not txt) and tesseract_to_text is not None:
+        try:
+            txt=tesseract_to_text(preprocess(img), lang="spa+eng")
+        except Exception: pass
+    return txt or ""
 
 def get_openrouter_key():
     return st.secrets.get("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY")
 
-def openrouter_chat(messages, model=None, temperature=0.1, max_tokens=800):
+def openrouter_chat(messages, model=None, temperature=0.1, max_tokens=1800):
     key=get_openrouter_key()
     if not key: return ""
     model=model or st.session_state.settings["model"]
@@ -178,12 +189,12 @@ def openrouter_chat(messages, model=None, temperature=0.1, max_tokens=800):
              "HTTP-Referer":"https://streamlit.io","X-Title":"RAG-Docs-Agenda"}
     payload={"model":model,"messages":messages,"temperature":temperature,"max_tokens":max_tokens}
     try:
-        r=requests.post(url,headers=headers,json=payload,timeout=60); r.raise_for_status()
-        data=r.json(); return data.get("choices",[{}])[0].get("message",{}).get("content","").strip()
+        r=requests.post(url,headers=headers,json=payload,timeout=90); r.raise_for_status()
+        data=r.json(); return (data.get("choices",[{}])[0].get("message",{}).get("content") or "").strip()
     except Exception: return ""
 
 def vision_extract_from_image_bytes(b: bytes) -> str:
-    key=get_openrouter_key(); vm=st.session_state.settings.get("vision_model")
+    vm=st.session_state.settings.get("vision_model"); key=get_openrouter_key()
     if not key or not vm: return ""
     b64=base64.b64encode(b).decode("utf-8")
     msg=[{"role":"user","content":[
@@ -211,16 +222,17 @@ def extract_from_pdf_bytes(b: bytes) -> tuple[str, Image.Image|None, int]:
         n=len(doc)
         for i,p in enumerate(doc):
             base_text=p.get_text("text") or ""
-            need_ocr = st.session_state.settings["force_ocr_pdf"] or len(base_text.strip())<10 or st.session_state.settings["read_method"]!="Auto"
+            need_ocr = st.session_state.settings["force_ocr_pdf"] or len(base_text.strip())<10
+            if st.session_state.settings["read_method"]=="Solo LLM visión": need_ocr=True
+            if st.session_state.settings["read_method"]=="Solo OCR (Python)": need_ocr=True
             if need_ocr:
                 pix=p.get_pixmap(matrix=fitz.Matrix(2,2))
                 img=Image.frombytes("RGB",[pix.width,pix.height],pix.samples)
                 if st.session_state.settings["read_method"]=="Solo LLM visión":
-                    tb=vision_extract_from_image_bytes(pix.tobytes())  # may be large; acceptable for demo
-                elif st.session_state.settings["read_method"]=="Solo OCR (Python)":
-                    tb=ocr_image_text(img)
+                    buf=io.BytesIO(); img.save(buf, format="PNG")
+                    tb=vision_extract_from_image_bytes(buf.getvalue())
                 else:
-                    tb=ocr_image_text(img) or vision_extract_from_image_bytes(pix.tobytes()) or base_text
+                    tb=ocr_image_text(img)
                 base_text=tb or base_text
                 if i==0: preview=img
             else:
@@ -235,13 +247,11 @@ def extract_from_image_bytes(b: bytes) -> tuple[str, Image.Image|None]:
     except Exception: return "", None
     if st.session_state.settings["read_method"]=="Solo LLM visión":
         txt=vision_extract_from_image_bytes(b)
-    elif st.session_state.settings["read_method"]=="Solo OCR (Python)":
-        txt=ocr_image_text(img)
     else:
-        txt=ocr_image_text(img) or vision_extract_from_image_bytes(b)
+        txt=ocr_image_text(img)
     return txt or "", img
 
-# Login (Karla)
+# login (Karla)
 def login_box():
     st.sidebar.markdown("### 🔐 Acceso")
     with st.sidebar.form("login"):
@@ -255,14 +265,15 @@ def login_box():
         else:
             st.session_state.auth=False; st.error("Usuario o contraseña incorrectos.")
 
-# Sidebar
+# sidebar
 def sidebar_config():
     st.sidebar.markdown("### ⚙️ Configuración")
     st.session_state.settings["project_name"]=st.sidebar.text_input("Proyecto", st.session_state.settings["project_name"])
-    st.session_state.settings["model"]=st.sidebar.text_input("Modelo (OpenRouter, texto)", st.session_state.settings["model"])
+    st.session_state.settings["model"]=st.sidebar.text_input("Modelo texto (OpenRouter)", st.session_state.settings["model"])
     st.session_state.settings["vision_model"]=st.sidebar.text_input("Modelo visión (OpenRouter)", st.session_state.settings["vision_model"])
-    st.session_state.settings["read_method"]=st.sidebar.selectbox("Método de lectura", ["Auto","Solo OCR (Python)","Solo LLM visión"], index=["Auto","Solo OCR (Python)","Solo LLM visión"].index(st.session_state.settings["read_method"]))
-    st.session_state.settings["force_ocr_pdf"]=st.sidebar.toggle("Forzar OCR en PDFs", value=st.session_state.settings["force_ocr_pdf"])
+    st.session_state.settings["read_method"]=st.sidebar.selectbox("Método de lectura", ["Solo OCR (Python)","Solo LLM visión"],
+                                                                  index=["Solo OCR (Python)","Solo LLM visión"].index(st.session_state.settings["read_method"]))
+    st.session_state.settings["force_ocr_pdf"]=st.sidebar.toggle("Forzar OCR en PDFs escaneados", value=st.session_state.settings["force_ocr_pdf"])
     st.sidebar.divider()
     st.sidebar.markdown("**RAG**")
     st.session_state.settings["chunk_size"]=st.sidebar.slider("Tamaño de chunk",400,2000,st.session_state.settings["chunk_size"],step=50)
@@ -273,17 +284,21 @@ def sidebar_config():
     with st.sidebar.expander("ℹ️ Ayuda rápida"):
         st.markdown("""
 <div class="side-hint">
-<b>Método de lectura</b>: elegir solo OCR (rápido local) o LLM visión (mejor en imágenes difíciles).<br>
-<b>Chunk</b>: tamaño de corte del texto para recuperar contexto.<br>
-<b>Solapamiento</b>: cuánto se repite entre chunks para no perder frases a caballo.<br>
-<b>Top-K</b>: cuántos chunks relevantes usar para responder.
+<b>Método de lectura</b>: “Solo OCR (Python)” usa EasyOCR/Tesseract; “Solo LLM visión” envía la imagen a tu modelo de OpenRouter.<br>
+<b>Chunk</b>: tamaño del corte usado para recuperar contexto.<br>
+<b>Solapamiento</b>: parte que se repite entre cortes (evita perder frases).<br>
+<b>Top-K</b>: cuántos fragmentos relevantes usa el RAG para responder.
 </div>
 """, unsafe_allow_html=True)
-    st.sidebar.divider()
-    payload={"settings":st.session_state.settings,"docs":st.session_state.docs,"events":st.session_state.events,"log":st.session_state.log,"exported_at":datetime.now().isoformat(timespec="seconds")}
-    st.download_button("💾 Exportar proyecto (.json)", json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+
+def export_project_button():
+    payload={"settings":st.session_state.settings,"docs":st.session_state.docs,"events":st.session_state.events,"log":st.session_state.log,
+             "exported_at":datetime.now().isoformat(timespec="seconds")}
+    st.download_button("💾 Descargar proyecto (.json)", json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
                        file_name=f"{st.session_state.settings['project_name']}.json", mime="application/json")
-    up=st.sidebar.file_uploader("Restaurar proyecto (.json)", type=["json"])
+
+def import_project_uploader():
+    up=st.file_uploader("Restaurar proyecto (.json)", type=["json"])
     if up is not None:
         try:
             data=json.load(io.TextIOWrapper(up, encoding="utf-8"))
@@ -292,56 +307,51 @@ def sidebar_config():
             st.session_state.events=data.get("events", [])
             st.session_state.log=data.get("log", [])
             st.success("Proyecto restaurado.")
+            log_event("import", f"Proyecto importado: {st.session_state.settings.get('project_name')}")
         except Exception as e:
-            st.error(f"Error al importar: {e}")
+            st.error(f"No se pudo importar: {e}")
 
-# Header
-st.markdown('<div class="hdr"><div class="t1">🧠 RAG de Documentos · 🗓️ Agenda</div><div class="t2">Tema oscuro · Login Karla · OCR/Visión seleccionable · Texto general · RAG · Calendario</div></div>', unsafe_allow_html=True)
+# header
+st.markdown('<div class="hdr"><div class="t1">🧠 RAG de Documentos · 🗓️ Agenda</div><div class="t2">Oscuro · Login Karla · OCR/Visión seleccionable · Texto general · RAG · Calendario</div></div>', unsafe_allow_html=True)
 login_box()
 if not st.session_state.auth: st.stop()
 sidebar_config()
+st.sidebar.divider(); export_project_button(); import_project_uploader()
 
-# Métricas
+# métricas
 c1,c2,c3,c4=st.columns(4)
 with c1: st.markdown(f'<div class="metric"><h3>Documentos</h3><div class="v">{len(st.session_state.docs)}</div></div>', unsafe_allow_html=True)
 with c2: st.markdown(f'<div class="metric"><h3>Chunks</h3><div class="v">{(st.session_state.index["matrix"].shape[0] if st.session_state.index else 0)}</div></div>', unsafe_allow_html=True)
 with c3: st.markdown(f'<div class="metric"><h3>Eventos</h3><div class="v">{len(st.session_state.events)}</div></div>', unsafe_allow_html=True)
 with c4: st.markdown(f'<div class="metric"><h3>Bitácora</h3><div class="v">{len(st.session_state.log)}</div></div>', unsafe_allow_html=True)
 
-# Tabs
 TAB_DOCS, TAB_TEXT, TAB_RAG, TAB_CAL, TAB_LOG, TAB_ADMIN = st.tabs(
-    ["📥 Documentos","🧾 Texto","🔎 RAG","🗓️ Calendario","📓 Bitácora","🧰 Admin"]
+    ["📥 Carga & Extracción","🧾 Texto","🔎 RAG","🗓️ Calendario","📓 Bitácora","🧰 Admin"]
 )
 
 # Carga & extracción
 with TAB_DOCS:
     st.subheader("Carga")
-    ups=st.file_uploader("Arrastra PDFs/Imágenes (png, jpg, webp)", type=["pdf","png","jpg","jpeg","webp"], accept_multiple_files=True)
+    ups=st.file_uploader("PDF / Imágenes (png, jpg, webp)", type=["pdf","png","jpg","jpeg","webp"], accept_multiple_files=True)
     if ups:
         for f in ups:
             doc_id=make_id()
             b=f.read()
-            texto,preview,paginas="","",0
             if f.type=="application/pdf":
-                t, prev, pags = extract_from_pdf_bytes(b)
-                texto=t; preview=prev; paginas=pags
+                texto, preview, paginas = extract_from_pdf_bytes(b)
             else:
-                t, img = extract_from_image_bytes(b)
-                texto=t; preview=img; paginas=1
+                texto, preview = extract_from_image_bytes(b); paginas=1
             md=extract_metadata(texto or "", f.name)
             doc={"id":doc_id,"nombre":md.get("nombre") or f.name,"origen":st.session_state.settings["origen"],
-                 "texto":texto or "","paginas":paginas,"metadata":{"fecha":md.get("fecha"),"folio":md.get("folio"),"rfc":md.get("rfc"),"total":md.get("total"),"etiquetas":""},
-                 "ts":datetime.now().isoformat(timespec="seconds")}
-            st.session_state.docs.append(doc)
-            log_event("doc:add", f.name, {"doc_id":doc_id,"origen":doc["origen"],"paginas":paginas})
+                 "texto":texto or "","paginas":paginas,"metadata":{"fecha":md.get("fecha"),"folio":md.get("folio"),
+                 "rfc":md.get("rfc"),"total":md.get("total"),"etiquetas":""},"ts":datetime.now().isoformat(timespec="seconds")}
+            st.session_state.docs.append(doc); log_event("doc:add", f.name, {"doc_id":doc_id,"origen":doc["origen"],"paginas":paginas})
             with st.expander(f"📄 {f.name}"):
                 cprev,cmeta=st.columns([1,2])
                 with cprev:
                     if isinstance(preview, Image.Image):
                         ann=annotate_preview(preview, texto)
-                        st.image(ann or preview, caption=f"Vista previa anotada ({paginas or 1} pág)", use_container_width=True)
-                        buf=io.BytesIO(); (ann or preview).save(buf, format="PNG")
-                        st.download_button("⬇️ PNG anotado", buf.getvalue(), file_name=f"{os.path.splitext(f.name)[0]}_anotado.png", mime="image/png")
+                        st.image(ann or preview, caption=f"Vista previa ({paginas or 1} pág)", use_container_width=True)
                     st.download_button("⬇️ Texto (.txt)", (texto or "").encode("utf-8"), file_name=f"{os.path.splitext(f.name)[0]}.txt", mime="text/plain")
                 with cmeta:
                     editable=st.data_editor(pd.DataFrame([{
@@ -359,17 +369,17 @@ with TAB_DOCS:
         df=pd.DataFrame([{ "ID":d["id"],"Nombre":d["nombre"],"Origen":d["origen"],"Fecha":d["metadata"].get("fecha"),
                            "Folio":d["metadata"].get("folio"),"RFC":d["metadata"].get("rfc"),"Total":d["metadata"].get("total"),
                            "Páginas":d.get("paginas",0),"Cargado":d.get("ts"),"Etiquetas":d["metadata"].get("etiquetas","")} for d in st.session_state.docs])
-        edited=st.data_editor(df, hide_index=True, use_container_width=True)
+        edited=st.data_editor(df, hide_index=True, use_container_width=True, num_rows="fixed")
         for _,row in edited.iterrows():
             d=next((x for x in st.session_state.docs if x["id"]==row["ID"]),None)
             if d:
                 d["nombre"]=row["Nombre"]; d["origen"]=row["Origen"]
                 d["metadata"].update({"fecha":row["Fecha"],"folio":row["Folio"],"rfc":row["RFC"],"total":row["Total"],"etiquetas":row.get("Etiquetas","")})
-        st.download_button("⬇️ Exportar CSV", edited.to_csv(index=False).encode("utf-8"), file_name="documentos.csv", mime="text/csv")
+        st.download_button("⬇️ Exportar docs (CSV)", edited.to_csv(index=False).encode("utf-8"), file_name="documentos.csv", mime="text/csv")
     else:
-        st.info("Carga documentos para comenzar.")
+        st.info("No hay documentos.")
 
-# TEXTO general
+# Texto general
 with TAB_TEXT:
     st.subheader("Texto general")
     if not st.session_state.docs:
@@ -380,20 +390,17 @@ with TAB_TEXT:
         dsel=next(d for d in st.session_state.docs if sel.startswith(d["nombre"]))
         colA,colB=st.columns([3,1])
         with colA:
-            txt_area=st.text_area("Contenido completo", dsel.get("texto",""), height=520, key=f"txt_{dsel['id']}")
+            st.text_area("Contenido completo", dsel.get("texto",""), height=520, key=f"full_{dsel['id']}")
         with colB:
             st.write("**Metadatos**"); st.json({"Nombre":dsel["nombre"], **dsel["metadata"], "Páginas":dsel.get("paginas",0)}, expanded=False)
-            st.download_button("⬇️ Descargar .txt", (dsel.get("texto","")).encode("utf-8"), file_name=f"{os.path.splitext(dsel['nombre'])[0]}.txt")
+            st.download_button("⬇️ .txt", (dsel.get("texto","")).encode("utf-8"), file_name=f"{os.path.splitext(dsel['nombre'])[0]}.txt")
             st.write("**Buscar**")
             q=st.text_input("Palabra/frase")
             if q:
                 txt=dsel.get("texto",""); matches=[m.start() for m in re.finditer(re.escape(q), txt, flags=re.IGNORECASE)]
                 st.caption(f"Coincidencias: {len(matches)}")
-                for i,pos in enumerate(matches[:10],1):
+                for i,pos in enumerate(matches[:12],1):
                     s=max(0,pos-80); e=min(len(txt),pos+80); st.markdown(f"**{i}.** …{txt[s:e]}…")
-        if st.button("Re-extraer con método actual"):
-            # re-extracción rápida si hay preview/bytes (no guardamos bytes; pedimos de nuevo al usuario si es necesario)
-            st.info("Carga nuevamente el archivo para re-extraer con el método seleccionado en la barra lateral.")
 
 # RAG
 with TAB_RAG:
@@ -404,16 +411,15 @@ with TAB_RAG:
             idx=build_index(st.session_state.docs, st.session_state.settings["chunk_size"], st.session_state.settings["chunk_overlap"])
             if idx: st.success(f"Índice listo ({idx['matrix'].shape[0]} chunks).")
             else: st.warning("No hay texto indexable.")
-        filtros=sorted(set(d.get("origen") for d in st.session_state.docs))
-        f_origen=st.multiselect("Filtrar por origen", filtros)
+        st.caption("Ajusta K/Chunk en la barra lateral.")
     with cB:
         q=st.text_input("Pregunta", placeholder="¿Cuál es el total de la factura X?")
         if q:
-            ctxs=retrieve(q, st.session_state.settings["top_k"], origin_filter=f_origen if f_origen else None) if st.session_state.index else []
+            ctxs=retrieve(q, st.session_state.settings["top_k"]) if st.session_state.index else []
             if not ctxs: st.warning("Construye el índice o carga documentos.")
             else:
                 blob="\n\n".join([f"[Doc: {c['doc']['nombre']} | Fecha: {c['doc']['metadata'].get('fecha')} | Folio: {c['doc']['metadata'].get('folio')}]\n{c['chunk']}" for c in ctxs])
-                msgs=[{"role":"system","content":"Responde solo con el contexto dado. Cita nombre/fecha/folio si aparece."},
+                msgs=[{"role":"system","content":"Responde solo con el contexto. Cita nombre/fecha/folio si aparece."},
                       {"role":"user","content":f"Contexto:\n{blob}\n\nPregunta: {q}"}]
                 ans=openrouter_chat(msgs, model=st.session_state.settings["model"], temperature=0.1, max_tokens=700)
                 st.markdown("### Respuesta"); st.write(ans or "(sin respuesta)")
@@ -437,23 +443,19 @@ with TAB_CAL:
             st.markdown('<div class="calendar-card">', unsafe_allow_html=True)
             cal=calendar(events=st.session_state.events or [], options=options, key=f"cal_{len(st.session_state.events)}")
             st.markdown('</div>', unsafe_allow_html=True)
-
-            if cal:
-                # clicks
-                if cal.get("eventClick"):
-                    ev=cal["eventClick"]["event"]; st.toast(f"{ev['title']} — {ev['start']}")
-                # selección de rango (algunas versiones exponen 'select' o 'selected')
-                sel=cal.get("select") or cal.get("selected")
-                if sel and st.session_state.get("allow_add_from_select", True):
-                    try:
-                        s=sel["start"]; e=sel.get("end", s)
-                        ev={"title":"Nuevo evento","start":s,"end":e,"color":"#60a5fa","extendedProps":{"creado_por":st.session_state.user}}
-                        st.session_state.events.append(ev); log_event("calendar:add","Nuevo (UI)")
-                        st.session_state.allow_add_from_select=False
-                        st.rerun()
-                    except Exception: pass
-                else:
-                    st.session_state.allow_add_from_select=True
+            if cal and cal.get("eventClick"):
+                ev=cal["eventClick"]["event"]; st.toast(f"{ev['title']} — {ev['start']}")
+            sel=cal.get("select") or cal.get("selected") if cal else None
+            if sel and st.session_state.get("allow_add_from_select", True):
+                try:
+                    s=sel["start"]; e=sel.get("end", s)
+                    ev={"title":"Nuevo evento","start":s,"end":e,"color":"#60a5fa","extendedProps":{"creado_por":st.session_state.user}}
+                    st.session_state.events.append(ev); log_event("calendar:add","Nuevo (UI)")
+                    st.session_state.allow_add_from_select=False
+                    st.rerun()
+                except Exception: pass
+            else:
+                st.session_state.allow_add_from_select=True
     with colR:
         with st.form("add_event"):
             titulo=st.text_input("Título","Revisión de documentos")
@@ -473,10 +475,9 @@ with TAB_CAL:
             def parse_iso(ts):
                 try: return datetime.fromisoformat(ts)
                 except Exception: return None
-            upcoming=[(parse_iso(e["start"]), e) for e in st.session_state.events if e.get("start")]
-            upcoming=[x for x in upcoming if x[0] is not None]; upcoming=sorted(upcoming,key=lambda x:x[0])
-            now=datetime.now()
-            future=[e for t,e in upcoming if 0 <= (t-now).days <= 7][:8]
+            up=[(parse_iso(e["start"]), e) for e in st.session_state.events if e.get("start")]
+            up=[x for x in up if x[0] is not None]; up=sorted(up,key=lambda x:x[0])
+            now=datetime.now(); future=[e for t,e in up if 0 <= (t-now).days <= 7][:8]
             for e in future:
                 st.markdown(f"<div class='card'><b>{e['title']}</b><br><span class='pill'>{e['start']}</span></div>", unsafe_allow_html=True)
             st.download_button("📥 Exportar eventos (JSON)", json.dumps(st.session_state.events, ensure_ascii=False, indent=2), "eventos.json")
