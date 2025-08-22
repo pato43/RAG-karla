@@ -1,5 +1,4 @@
-# app.py — RAG + Agenda (oscuro, Karla, OCR/LLM seleccionable, calendario estético)
-
+# app.py — RAG + Agenda (oscuro) con extracción de texto: LLM visión o OCR local (EasyOCR)
 import os, io, json, base64, re
 from datetime import datetime, date, timedelta
 from typing import List, Dict, Any
@@ -13,21 +12,17 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 
+# PDF
 try: import fitz  # PyMuPDF
 except Exception: fitz = None
 
+# Calendario
 try: from streamlit_calendar import calendar
 except Exception: calendar = None
 
-# OCR opcional
+# OCR local
 try: import easyocr
 except Exception: easyocr = None
-try:
-    import pytesseract
-    from pytesseract import image_to_string as tesseract_to_text
-except Exception:
-    pytesseract = None
-    tesseract_to_text = None
 
 st.set_page_config(page_title="RAG + Agenda", page_icon="🧠", layout="wide")
 st.markdown("""
@@ -49,7 +44,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# estado
+# Estado
 if "auth" not in st.session_state: st.session_state.auth=False
 if "user" not in st.session_state: st.session_state.user=None
 if "docs" not in st.session_state: st.session_state.docs=[]
@@ -59,8 +54,8 @@ if "log" not in st.session_state: st.session_state.log=[]
 if "settings" not in st.session_state:
     st.session_state.settings={
         "project_name":"RAG-Agenda",
-        "model":"openrouter/some-text-model",
-        "vision_model":"openrouter/some-vision-model",
+        "model":"openai/gpt-4o-mini",
+        "vision_model":"openai/gpt-4o-mini",
         "chunk_size":1000,
         "chunk_overlap":200,
         "top_k":5,
@@ -72,7 +67,6 @@ if "settings" not in st.session_state:
 def log_event(tipo, detalle, extra=None):
     st.session_state.log.append({"timestamp":datetime.now().isoformat(timespec="seconds"),
                                  "tipo":tipo,"detalle":detalle,"extra":extra or {}, "usuario":st.session_state.user})
-
 def make_id():
     return base64.urlsafe_b64encode(os.urandom(9)).decode("utf-8").rstrip("=")
 
@@ -143,7 +137,7 @@ def retrieve(query, top_k):
             out.append({"score":float(sims[ti]),"doc":doc,"chunk":ctx})
     return out
 
-# OCR / visión
+# OCR local
 _OCR=None
 def get_ocr():
     global _OCR
@@ -156,27 +150,23 @@ def preprocess(img: Image.Image) -> Image.Image:
     g=img.convert("L")
     w,h=g.size
     if max(w,h)<1600:
-        s=1600/max(w,h)
-        g=g.resize((int(w*s), int(h*s)))
+        s=1600/max(w,h); g=g.resize((int(w*s), int(h*s)))
     g=ImageEnhance.Contrast(g).enhance(1.6)
     g=ImageEnhance.Sharpness(g).enhance(1.2)
     return g
 
 def ocr_image_text(img: Image.Image) -> str:
-    txt=""
-    r=get_ocr()
-    if r is not None:
-        try:
-            arr=np.array(preprocess(img))
-            res=r.readtext(arr, detail=0, paragraph=True)
-            txt="\n".join([t.strip() for t in res if t and t.strip()])
-        except Exception: pass
-    if (not txt) and tesseract_to_text is not None:
-        try:
-            txt=tesseract_to_text(preprocess(img), lang="spa+eng")
-        except Exception: pass
-    return txt or ""
+    if easyocr is None: return ""
+    try:
+        import numpy as np
+        arr=np.array(preprocess(img))
+        r=get_ocr()
+        if r is None: return ""
+        res=r.readtext(arr, detail=0, paragraph=True)
+        return "\n".join([t.strip() for t in res if t and t.strip()])
+    except Exception: return ""
 
+# OpenRouter
 def get_openrouter_key():
     return st.secrets.get("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY")
 
@@ -251,7 +241,7 @@ def extract_from_image_bytes(b: bytes) -> tuple[str, Image.Image|None]:
         txt=ocr_image_text(img)
     return txt or "", img
 
-# login (Karla)
+# Login (Karla)
 def login_box():
     st.sidebar.markdown("### 🔐 Acceso")
     with st.sidebar.form("login"):
@@ -265,7 +255,7 @@ def login_box():
         else:
             st.session_state.auth=False; st.error("Usuario o contraseña incorrectos.")
 
-# sidebar
+# Sidebar
 def sidebar_config():
     st.sidebar.markdown("### ⚙️ Configuración")
     st.session_state.settings["project_name"]=st.sidebar.text_input("Proyecto", st.session_state.settings["project_name"])
@@ -274,8 +264,7 @@ def sidebar_config():
     st.session_state.settings["read_method"]=st.sidebar.selectbox("Método de lectura", ["Solo OCR (Python)","Solo LLM visión"],
                                                                   index=["Solo OCR (Python)","Solo LLM visión"].index(st.session_state.settings["read_method"]))
     st.session_state.settings["force_ocr_pdf"]=st.sidebar.toggle("Forzar OCR en PDFs escaneados", value=st.session_state.settings["force_ocr_pdf"])
-    st.sidebar.divider()
-    st.sidebar.markdown("**RAG**")
+    st.sidebar.divider(); st.sidebar.markdown("**RAG**")
     st.session_state.settings["chunk_size"]=st.sidebar.slider("Tamaño de chunk",400,2000,st.session_state.settings["chunk_size"],step=50)
     st.session_state.settings["chunk_overlap"]=st.sidebar.slider("Solapamiento",0,400,st.session_state.settings["chunk_overlap"],step=20)
     st.session_state.settings["top_k"]=st.sidebar.slider("Top-K",1,10,st.session_state.settings["top_k"])
@@ -284,10 +273,9 @@ def sidebar_config():
     with st.sidebar.expander("ℹ️ Ayuda rápida"):
         st.markdown("""
 <div class="side-hint">
-<b>Método de lectura</b>: “Solo OCR (Python)” usa EasyOCR/Tesseract; “Solo LLM visión” envía la imagen a tu modelo de OpenRouter.<br>
-<b>Chunk</b>: tamaño del corte usado para recuperar contexto.<br>
-<b>Solapamiento</b>: parte que se repite entre cortes (evita perder frases).<br>
-<b>Top-K</b>: cuántos fragmentos relevantes usa el RAG para responder.
+<b>Método de lectura</b>: OCR local = EasyOCR; LLM visión = modelo de OpenRouter.<br>
+<b>Chunk/Solapamiento</b>: cortes del texto para recuperar contexto.<br>
+<b>Top-K</b>: nº de fragmentos relevantes usados en la respuesta.
 </div>
 """, unsafe_allow_html=True)
 
@@ -296,7 +284,6 @@ def export_project_button():
              "exported_at":datetime.now().isoformat(timespec="seconds")}
     st.download_button("💾 Descargar proyecto (.json)", json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
                        file_name=f"{st.session_state.settings['project_name']}.json", mime="application/json")
-
 def import_project_uploader():
     up=st.file_uploader("Restaurar proyecto (.json)", type=["json"])
     if up is not None:
@@ -306,19 +293,16 @@ def import_project_uploader():
             st.session_state.docs=data.get("docs", [])
             st.session_state.events=data.get("events", [])
             st.session_state.log=data.get("log", [])
-            st.success("Proyecto restaurado.")
-            log_event("import", f"Proyecto importado: {st.session_state.settings.get('project_name')}")
+            st.success("Proyecto restaurado."); log_event("import", f"Proyecto importado: {st.session_state.settings.get('project_name')}")
         except Exception as e:
             st.error(f"No se pudo importar: {e}")
 
-# header
+# UI
 st.markdown('<div class="hdr"><div class="t1">🧠 RAG de Documentos · 🗓️ Agenda</div><div class="t2">Oscuro · Login Karla · OCR/Visión seleccionable · Texto general · RAG · Calendario</div></div>', unsafe_allow_html=True)
 login_box()
 if not st.session_state.auth: st.stop()
-sidebar_config()
-st.sidebar.divider(); export_project_button(); import_project_uploader()
+sidebar_config(); st.sidebar.divider(); export_project_button(); import_project_uploader()
 
-# métricas
 c1,c2,c3,c4=st.columns(4)
 with c1: st.markdown(f'<div class="metric"><h3>Documentos</h3><div class="v">{len(st.session_state.docs)}</div></div>', unsafe_allow_html=True)
 with c2: st.markdown(f'<div class="metric"><h3>Chunks</h3><div class="v">{(st.session_state.index["matrix"].shape[0] if st.session_state.index else 0)}</div></div>', unsafe_allow_html=True)
@@ -362,7 +346,6 @@ with TAB_DOCS:
                     doc["nombre"]=row["Nombre"]; doc["origen"]=row["Origen"]
                     doc["metadata"].update({"fecha":row["Fecha"],"folio":row["Folio"],"rfc":row["RFC"],"total":row["Total"],"etiquetas":row["Etiquetas"]})
                     st.text_area("Texto extraído (resumen)", (texto or "")[:2500], height=200)
-
     st.divider()
     st.subheader("Tabla")
     if st.session_state.docs:
@@ -409,7 +392,7 @@ with TAB_RAG:
     with cA:
         if st.button("🧱 (Re)construir índice", type="primary"):
             idx=build_index(st.session_state.docs, st.session_state.settings["chunk_size"], st.session_state.settings["chunk_overlap"])
-            if idx: st.success(f"Índice listo ({idx['matrix'].shape[0]} chunks).")
+            if idx: st.success(f"Índice listo ({idx['matrix'].shape[0]} chunks)."); log_event("rag:index", f"chunks={idx['matrix'].shape[0]}")
             else: st.warning("No hay texto indexable.")
         st.caption("Ajusta K/Chunk en la barra lateral.")
     with cB:
@@ -426,7 +409,7 @@ with TAB_RAG:
                 with st.expander("Contexto usado"):
                     for i,c in enumerate(ctxs,1):
                         meta=c['doc']['metadata']; st.markdown(f"**{i}. {c['doc']['nombre']}** · score={c['score']:.3f} · Fecha: {meta.get('fecha')} · Folio: {meta.get('folio')}")
-                        st.write(c["chunk"][:1600])
+                        st.write(c["chunk"][:1600]); log_event("rag:qa", f"Q={q}")
 
 # Calendario
 with TAB_CAL:
@@ -451,8 +434,7 @@ with TAB_CAL:
                     s=sel["start"]; e=sel.get("end", s)
                     ev={"title":"Nuevo evento","start":s,"end":e,"color":"#60a5fa","extendedProps":{"creado_por":st.session_state.user}}
                     st.session_state.events.append(ev); log_event("calendar:add","Nuevo (UI)")
-                    st.session_state.allow_add_from_select=False
-                    st.rerun()
+                    st.session_state.allow_add_from_select=False; st.rerun()
                 except Exception: pass
             else:
                 st.session_state.allow_add_from_select=True
